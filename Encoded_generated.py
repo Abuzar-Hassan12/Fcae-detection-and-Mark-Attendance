@@ -3,48 +3,74 @@ import face_recognition
 import pickle
 import os
 
+# Define the path to the folder where images are stored
+images_Path = 'resized_images'
+encoding_file_path = 'Encoding_File.p'
 
-#NOTE importing the Students images
+# Load existing encodings if the file exists
+if os.path.exists(encoding_file_path):
+    with open(encoding_file_path, 'rb') as f:
+        founded_encodings_with_ID = pickle.load(f)
+    existing_encodings, existing_IDs = founded_encodings_with_ID
+else:
+    existing_encodings, existing_IDs = [], []
 
-# Define the path to the folder where modes (images) are stored
-images_Path = 'images'
-
-# List all the contents in the specified 'modeFolderPath'
+# List all the image files in the directory
 stud_images_path = os.listdir(images_Path)
 
-# Initialize an empty list to store images that will be loaded
+# Initialize lists for new images
 stud_img_List = []
-stud_ID=[]
-# Iterate through each path (image) in the directory
+stud_ID = []
+
+# Load new images that have not been encoded before
 for path in stud_images_path:
-    # Join the folder path with the current file/folder name to get the full path
-    # Read the image from the full path using OpenCV and append it to the list
-    stud_img_List.append(cv2.imread(os.path.join(images_Path, path)))
-    #ID are like 4313.png ->split -> '4313','.png'
-    #we need actually 4313 (that is at 0 index) split text
-    stud_ID.append(os.path.splitext(path)[0])
+    student_id = os.path.splitext(path)[0]
     
-# NOTE print(stud_ID) # splited IDs of all Student
-
-# NOTE find Encodings of the images of students
-def findencoding(stud_img_List):
-    encoded_list=[]
-    for img in stud_img_List:
-        # FOR encoding first step is to change color
-        img =cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
-        # 2nd find Encodings
-        encode = face_recognition.face_encodings(img)[0]
-        encoded_list.append(encode)
+    if student_id in existing_IDs:
+        print(f"Skipping already encoded image: {path}")
+        continue  # Skip already processed images
     
-    return encoded_list
+    img_path = os.path.join(images_Path, path)
+    img = cv2.imread(img_path)
+    
+    if img is None:
+        print(f"❌ Error: Could not load image {path}. Check if the file exists and is accessible.")
+        continue
+    
+    stud_img_List.append(img)
+    stud_ID.append(student_id)
 
-#Encoded images are now founded 
-founded_encodings=findencoding(stud_img_List)
+# Function to find encodings
+def findencoding(stud_img_List, stud_ID):
+    encoded_list = []
+    valid_IDs = []
+    
+    for i, img in enumerate(stud_img_List):
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        encodings = face_recognition.face_encodings(img)
+        
+        if len(encodings) == 1:  # Ensure only one face is detected
+            encoded_list.append(encodings[0])
+            valid_IDs.append(stud_ID[i])
+        elif len(encodings) > 1:
+            print(f"⚠️ Warning: Multiple faces detected in {stud_ID[i]}, skipping it!")
+        else:
+            print(f"⚠️ Warning: No face detected in {stud_ID[i]}, skipping it!")
+    
+    return encoded_list, valid_IDs
 
-# we need file where we can store encodings with relevents ID so we can use that file 
-# in WebCam
-founded_encodings_with_ID =[founded_encodings,stud_ID]
-
-encoded_file =open('Encoding File.p','wb')
-pickle.dump(founded_encodings_with_ID,encoded_file)
-encoded_file.close()
+# Find encodings for new images
+if stud_img_List:
+    new_encodings, new_IDs = findencoding(stud_img_List, stud_ID)
+    
+    # Append new encodings to existing ones
+    existing_encodings.extend(new_encodings)
+    existing_IDs.extend(new_IDs)
+    
+    # Save updated encodings
+    with open(encoding_file_path, 'wb') as f:
+        pickle.dump([existing_encodings, existing_IDs], f)
+    
+    print("✅ Encodings updated successfully!")
+else:
+    print("✅ No new images to encode.")

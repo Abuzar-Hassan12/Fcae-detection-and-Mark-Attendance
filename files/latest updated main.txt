@@ -107,81 +107,6 @@ def mark_absentees_before_attendance(excel_file_path):
         if updated:
             df.to_excel(excel_file_path, index=False)
             print(f"Absentees marked: {excel_file_path}")
-
-def is_already_present(student_id):
-    """Return True if attendance for today is already marked as 'P'."""
-    try:
-        excel_path = get_excel_path(student_id)
-        current_time = datetime.now()
-        today_date = current_time.strftime('%d-%m-%Y')
-        with EXCEL_LOCK:
-            df = pd.read_excel(excel_path)
-            df = clean_columns(df)
-            status_col = f'{today_date} Status'
-            if status_col in df.columns:
-                student_row = df[df['Student ID'] == student_id]
-                if not student_row.empty and student_row.iloc[0][status_col] == 'P':
-                    return True
-        return False
-    except Exception as e:
-        print(f"Error checking attendance for {student_id}: {e}")
-        return False
-
-def MarkAttendance(student_id):
-    global detected_students
-    with EXCEL_LOCK:
-        current_time = datetime.now()
-        if not (ATTENDANCE_START_TIME <= current_time.time() <= ATTENDANCE_END_TIME):
-            print(f"Attendance closed for {student_id}")
-            return
-
-        excel_path = get_excel_path(student_id)
-        today_date = current_time.strftime('%d-%m-%Y')
-        
-        try:
-            df = pd.read_excel(excel_path)
-            df = clean_columns(df)
-            df['Student ID'] = df['Student ID'].astype(str)
-
-            status_col = f'{today_date} Status'
-            time_col = f'{today_date} Time'
-
-            if status_col not in df.columns:
-                df[status_col] = 'A'
-                df[time_col] = '00:00:00'
-
-            student_row = df[df['Student ID'] == student_id]
-            if student_row.empty:
-                print(f"Student {student_id} not found")
-                return
-
-            idx = student_row.index[0]
-            # If already marked present, do not mark again.
-            if df.at[idx, status_col] == 'P':
-                return
-
-            df.at[idx, status_col] = 'P'
-            df.at[idx, time_col] = current_time.strftime("%I:%M:%S %p")
-            df.at[idx, 'Total Attendance'] += 1
-            
-            df.to_excel(excel_path, index=False)
-            detected_students.add(student_id)
-            print(f"Marked Present: {student_id}")
-
-        except Exception as e:
-            print(f"Excel Error: {str(e)}")
-
-def LoadStudentName(student_id):
-    try:
-        excel_path = get_excel_path(student_id)
-        with EXCEL_LOCK:
-            df = pd.read_excel(excel_path)
-            df = clean_columns(df)
-            row = df[df['Student ID'] == student_id].iloc[0]
-            return row['Name'], row['Total Attendance']
-    except:
-        return f"Student {student_id}", 0
-
 # ========================
 # FILE PATH CONFIGURATION
 # ========================
@@ -213,6 +138,60 @@ def get_excel_path(student_id):
 def get_major(student_id):
     return os.path.basename(get_excel_path(student_id)).split('.')[0]
 
+def MarkAttendance(student_id):
+    global detected_students
+    with EXCEL_LOCK:
+        current_time = datetime.now()
+        if not (ATTENDANCE_START_TIME <= current_time.time() <= ATTENDANCE_END_TIME):
+            print(f"Attendance closed for {student_id}")
+            return
+
+        excel_path = get_excel_path(student_id)
+        today_date = current_time.strftime('%d-%m-%Y')
+        
+        try:
+            df = pd.read_excel(excel_path)
+            df = clean_columns(df)
+            df['Student ID'] = df['Student ID'].astype(str)
+
+            status_col = f'{today_date} Status'
+            time_col = f'{today_date} Time'
+
+            if status_col not in df.columns:
+                df[status_col] = 'A'
+                df[time_col] = '00:00:00'
+
+            student_row = df[df['Student ID'] == student_id]
+            if student_row.empty:
+                print(f"Student {student_id} not found")
+                return
+
+            idx = student_row.index[0]
+            if df.at[idx, status_col] == 'P':
+                return
+
+            df.at[idx, status_col] = 'P'
+            df.at[idx, time_col] = current_time.strftime("%I:%M:%S %p")
+            df.at[idx, 'Total Attendance'] += 1
+            
+            df.to_excel(excel_path, index=False)
+            detected_students.add(student_id)
+            print(f"Marked Present: {student_id}")
+
+        except Exception as e:
+            print(f"Excel Error: {str(e)}")
+
+def LoadStudentName(student_id):
+    try:
+        excel_path = get_excel_path(student_id)
+        with EXCEL_LOCK:
+            df = pd.read_excel(excel_path)
+            df = clean_columns(df)
+            row = df[df['Student ID'] == student_id].iloc[0]
+            return row['Name'], row['Total Attendance']
+    except:
+        return f"Student {student_id}", 0
+
 # ========================
 # VIDEO PROCESSING FUNCTIONS
 # ========================
@@ -234,64 +213,41 @@ def reset_daily_state():
         for path in step_files:
             mark_absentees_before_attendance(path)
 
-def process_frame(frame, frame_bg):
+def process_frame(frame):
     global current_mode, mode_start_time, current_student_id
-
-    # Resize frame for faster face detection
+    
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
     rgb_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
     
     face_locations = face_recognition.face_locations(rgb_frame)
     face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
     
-    # Process each detected face
-    for encoding, face_location in zip(face_encodings, face_locations):
+    for encoding, location in zip(face_encodings, face_locations):
         matches = face_recognition.compare_faces(founded_encodings, encoding, FACE_MATCH_THRESHOLD)
         face_distances = face_recognition.face_distance(founded_encodings, encoding)
-
+        
         if not matches[np.argmin(face_distances)]:
             continue
-
+            
         student_id = stud_ID[np.argmin(face_distances)]
         last_seen[student_id] = time.time()
-
-        # Scale the coordinates from the small frame to the original size
-        top, right, bottom, left = [v * 4 for v in face_location]
-
-        # Draw the rectangle directly on frame_bg by adding the background offsets (55, 162)
-        cv2.rectangle(frame_bg, (55 + left, 162 + top), (55 + right, 162 + bottom), (0, 255, 0), 2)
-    
-        # Draw the student ID above the rectangle on frame_bg
-        cv2.putText(frame_bg, f"ID: {student_id}", (55 + left, 162 + top - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Attendance and mode processing logic remains unchanged...
         if student_id not in detected_students:
-            if is_already_present(student_id):
-                if time.time() - cooldown_tracker.get(student_id, 0) > COOLDOWN_SECONDS:
-                    current_mode = 3
-                    mode_start_time = time.time()
-                    cooldown_tracker[student_id] = time.time()
-                detected_students.add(student_id)
-            else:
-                if current_student_id is None or current_student_id != student_id:
-                    MarkAttendance(student_id)
-                    detected_students.add(student_id)
-                    current_mode = 1
-                    mode_start_time = time.time()
-                    current_student_id = student_id
-                    
-                    if student_id not in student_data:
-                        name, attendance = LoadStudentName(student_id)
-                        img_path = f'C:/Face-Detection-System/resized_images/{student_id}.jpg'
-                        student_data[student_id] = {
-                            'name': name,
-                            'attendance': attendance,
-                            'image': cv2.imread(img_path) if os.path.exists(img_path) else None
-                        }
+            MarkAttendance(student_id)
+            detected_students.add(student_id)
+            current_mode = 1
+            mode_start_time = time.time()
+            current_student_id = student_id
+            
+            if student_id not in student_data:
+                name, attendance = LoadStudentName(student_id)
+                img_path = f'C:/Face-Detection-System/resized_images/{student_id}.jpg'
+                student_data[student_id] = {
+                    'name': name,
+                    'attendance': attendance,
+                    'image': cv2.imread(img_path) if os.path.exists(img_path) else None
+                }
         else:
-            if current_student_id == student_id and current_mode in [1, 2]:
-                continue
             if time.time() - cooldown_tracker.get(student_id, 0) > COOLDOWN_SECONDS:
                 current_mode = 3
                 mode_start_time = time.time()
@@ -301,8 +257,8 @@ def process_frame(frame, frame_bg):
 # MAIN SYSTEM LOOP
 # ========================
 def main():
-    global current_mode, mode_start_time, current_student_id
-
+    global current_mode, mode_start_time
+    
     # Initialization
     load_encodings()
     load_mode_images()
@@ -336,15 +292,12 @@ def main():
             continue
 
         reset_daily_state()
-        # Create a copy of the background to overlay the webcam feed
         frame_bg = imagebackground.copy()
         frame_bg[162:162+480, 55:55+640] = img
         
-        # Process the frame for face detection and mode updates.
-        process_frame(img, frame_bg)
-
+        process_frame(img)
         
-        # Mode transitions handling
+        # Mode transitions
         if current_mode in [1, 2, 3] and mode_start_time:
             elapsed = time.time() - mode_start_time
             if elapsed > MODE_DISPLAY_DURATION:
@@ -355,13 +308,12 @@ def main():
                     current_mode = 0
                     if current_student_id:
                         cooldown_tracker[current_student_id] = time.time()
-                    current_student_id = None
                     mode_start_time = None
                 elif current_mode == 3:
                     current_mode = 0
                     mode_start_time = None
 
-        # UI rendering: overlay the mode image on the background
+        # UI rendering
         frame_bg[44:44+633, 808:808+414] = imgModeList[current_mode]
         
         if current_mode == 1 and current_student_id:
@@ -388,8 +340,8 @@ def main():
             print("User requested exit. Exiting...")
             break
         if cv2.getWindowProperty("STEP School Talagang Campus", cv2.WND_PROP_VISIBLE) < 1:
-            print("Window closed by user. Exiting...")
-            break
+                print("Window closed by user. Exiting...")
+                break
     cap.release()
     cv2.destroyAllWindows()
 

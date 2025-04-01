@@ -3,74 +3,55 @@ import face_recognition
 import pickle
 import os
 
-# Define the path to the folder where images are stored
-images_Path = 'resized_images'
-encoding_file_path = 'Encoding_File.p'
-
-# Load existing encodings if the file exists
-if os.path.exists(encoding_file_path):
-    with open(encoding_file_path, 'rb') as f:
-        founded_encodings_with_ID = pickle.load(f)
-    existing_encodings, existing_IDs = founded_encodings_with_ID
-else:
-    existing_encodings, existing_IDs = [], []
-
-# List all the image files in the directory
+# Define the path to the folder containing student images
+images_Path = 'images'
 stud_images_path = os.listdir(images_Path)
 
-# Initialize lists for new images
-stud_img_List = []
+# Initialize lists to store encodings and corresponding IDs
+encoded_list = []
 stud_ID = []
 
-# Load new images that have not been encoded before
-for path in stud_images_path:
-    student_id = os.path.splitext(path)[0]
+def find_encodings(images_path_list):
+    valid_encodings = []
+    valid_ids = []
     
-    if student_id in existing_IDs:
-        print(f"Skipping already encoded image: {path}")
-        continue  # Skip already processed images
-    
-    img_path = os.path.join(images_Path, path)
-    img = cv2.imread(img_path)
-    
-    if img is None:
-        print(f"❌ Error: Could not load image {path}. Check if the file exists and is accessible.")
-        continue
-    
-    stud_img_List.append(img)
-    stud_ID.append(student_id)
-
-# Function to find encodings
-def findencoding(stud_img_List, stud_ID):
-    encoded_list = []
-    valid_IDs = []
-    
-    for i, img in enumerate(stud_img_List):
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        encodings = face_recognition.face_encodings(img)
+    for path in images_path_list:
+        full_path = os.path.join(images_Path, path)
+        # Load image
+        img = cv2.imread(full_path)
+        if img is None:
+            print(f"Warning: Could not read image {path}. Skipping.")
+            continue
         
-        if len(encodings) == 1:  # Ensure only one face is detected
-            encoded_list.append(encodings[0])
-            valid_IDs.append(stud_ID[i])
-        elif len(encodings) > 1:
-            print(f"⚠️ Warning: Multiple faces detected in {stud_ID[i]}, skipping it!")
-        else:
-            print(f"⚠️ Warning: No face detected in {stud_ID[i]}, skipping it!")
-    
-    return encoded_list, valid_IDs
+        # Convert image to RGB format
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Find face locations and encodings
+        face_locations = face_recognition.face_locations(img_rgb, model='hog')  # 'cnn' for better accuracy
+        face_encodings = face_recognition.face_encodings(img_rgb, face_locations)
 
-# Find encodings for new images
-if stud_img_List:
-    new_encodings, new_IDs = findencoding(stud_img_List, stud_ID)
+        if len(face_encodings) == 0:
+            print(f"No face detected in {path}. Skipping.")
+            continue
+        
+        # Select the largest face (best candidate for ID matching)
+        largest_face_index = max(range(len(face_locations)), key=lambda i: (face_locations[i][2] - face_locations[i][0]) * (face_locations[i][1] - face_locations[i][3]))
+        valid_encodings.append(face_encodings[largest_face_index])
+        
+        # Add the corresponding student ID (filename without extension)
+        valid_ids.append(os.path.splitext(path)[0])
     
-    # Append new encodings to existing ones
-    existing_encodings.extend(new_encodings)
-    existing_IDs.extend(new_IDs)
-    
-    # Save updated encodings
-    with open(encoding_file_path, 'wb') as f:
-        pickle.dump([existing_encodings, existing_IDs], f)
-    
-    print("✅ Encodings updated successfully!")
-else:
-    print("✅ No new images to encode.")
+    return valid_encodings, valid_ids
+
+# Process all images and get valid encodings with IDs
+encoded_list, stud_ID = find_encodings(stud_images_path)
+
+# Save the encodings with corresponding IDs to a temporary file first
+temp_file = 'Encoding File.temp.p'
+with open(temp_file, 'wb') as encoded_file:
+    pickle.dump([encoded_list, stud_ID], encoded_file)
+
+# Rename temp file to avoid corruption issues
+os.replace(temp_file, 'Encoding File.p')
+
+print(f"Successfully encoded {len(encoded_list)} images out of {len(stud_images_path)}")

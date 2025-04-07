@@ -1,13 +1,14 @@
 import cv2
+#import matplotlib.pyplot as plt
 import os
 import pickle
-import face_recognition
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import time
 import re
 from threading import Lock
+from insightface.app import FaceAnalysis
 
 # ========================
 # CONFIGURATION SETTINGS
@@ -18,9 +19,9 @@ imagebackground = cv2.imread('Resources/background.png')
 HOLIDAYS = ['23-03-2025', '01-05-2025', '14-08-2025']
 FRAME_WIDTH, FRAME_HEIGHT = 640, 480
 MODE_DISPLAY_DURATION = 5
-FACE_MATCH_THRESHOLD = 0.415
+FACE_MATCH_THRESHOLD = 0.6  # Cosine similarity threshold
 ATTENDANCE_START_TIME = datetime.strptime("6:00:00 AM", "%I:%M:%S %p").time()
-ATTENDANCE_END_TIME = datetime.strptime("10:00:00 AM", "%I:%M:%S %p").time()
+ATTENDANCE_END_TIME = datetime.strptime("11:00:00 AM", "%I:%M:%S %p").time()
 COOLDOWN_SECONDS = 30  # Increased cooldown period
 EXCEL_LOCK = Lock()  # Thread safety for Excel operations
 
@@ -35,6 +36,7 @@ current_mode = 0
 mode_start_time = None
 current_student_id = None
 last_date_check = datetime.now()
+face_analyzer = None
 
 # ========================
 # INITIALIZATION FUNCTIONS
@@ -42,7 +44,11 @@ last_date_check = datetime.now()
 def load_encodings():
     global founded_encodings, stud_ID
     with open(ENCODING_FILE, 'rb') as encode_file:
-        founded_encodings, stud_ID = pickle.load(encode_file)
+        encodings_dict = pickle.load(encode_file)
+        founded_encodings, stud_ID = encodings_dict['encodings'], encodings_dict['ids']
+    
+    # Convert to NumPy float32 array for InsightFace compatibility
+    founded_encodings = np.array(founded_encodings, dtype=np.float32)
 
 def load_mode_images():
     global imgModeList
@@ -56,6 +62,11 @@ def load_mode_images():
         raise ValueError(f"Need exactly 4 mode images. Found {len(mode_files)}")
 
     imgModeList = [cv2.imread(os.path.join(modeFolderPath, f)) for f in mode_files]
+
+def init_face_analyzer():
+    global face_analyzer
+    face_analyzer = FaceAnalysis(name="buffalo_l")
+    face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
 
 # ========================
 # ATTENDANCE CORE FUNCTIONS
@@ -108,6 +119,22 @@ def mark_absentees_before_attendance(excel_file_path):
             df.to_excel(excel_file_path, index=False)
             print(f"Absentees marked: {excel_file_path}")
 
+def preload_detected_students():
+    global detected_students
+    today_date = datetime.now().strftime('%d-%m-%Y')
+    for excel_path in STEP_FILES.values():
+        try:
+            with EXCEL_LOCK:
+                df = pd.read_excel(excel_path)
+                df = clean_columns(df)
+                status_col = f'{today_date} Status'
+                if status_col in df.columns:
+                    present_students = df[df[status_col] == 'P']['Student ID'].astype(str).tolist()
+                    detected_students.update(present_students)
+                    print(f"Preloaded detected students from {excel_path}: {present_students}")
+        except Exception as e:
+            print(f"Error preloading detected students from {excel_path}: {e}")
+
 def is_already_present(student_id):
     """Return True if attendance for today is already marked as 'P'."""
     try:
@@ -156,7 +183,6 @@ def MarkAttendance(student_id):
                 return
 
             idx = student_row.index[0]
-            # If already marked present, do not mark again.
             if df.at[idx, status_col] == 'P':
                 return
 
@@ -187,8 +213,14 @@ def LoadStudentName(student_id):
 # ========================
 STEP_FILES = {
     "FY10": "C:/Face-Detection-System/stud_data/FY1.xlsx",
-    "42": "C:/Face-Detection-System/stud_data/STEP 2.xlsx", 
-    "43": "C:/Face-Detection-System/stud_data/STEP 3.xlsx"
+    "FY20": "C:/Face-Detection-System/stud_data/FY2.xlsx", 
+    "FY30": "C:/Face-Detection-System/stud_data/FY3.xlsx",
+    "ST10": "C:/Face-Detection-System/stud_data/ST1.xlsx",
+    "ST20": "C:/Face-Detection-System/stud_data/ST2.xlsx",
+    "ST30": "C:/Face-Detection-System/stud_data/ST3.xlsx",
+    "ST40": "C:/Face-Detection-System/stud_data/ST4.xlsx",
+    "ST50": "C:/Face-Detection-System/stud_data/ST5.xlsx",
+    "ST60": "C:/Face-Detection-System/stud_data/ST6.xlsx",
 }
 
 def get_excel_path(student_id):
@@ -228,8 +260,14 @@ def reset_daily_state():
         
         step_files = [
             'C:/Face-Detection-System/stud_data/FY1.xlsx',
-            'C:/Face-Detection-System/stud_data/STEP 2.xlsx',
-            'C:/Face-Detection-System/stud_data/STEP 3.xlsx'
+            'C:/Face-Detection-System/stud_data/FY2.xlsx',
+            'C:/Face-Detection-System/stud_data/FY3.xlsx',
+            'C:/Face-Detection-System/stud_data/ST1.xlsx',
+            'C:/Face-Detection-System/stud_data/ST2.xlsx',
+            'C:/Face-Detection-System/stud_data/ST3.xlsx',
+            'C:/Face-Detection-System/stud_data/ST4.xlsx',
+            'C:/Face-Detection-System/stud_data/ST5.xlsx',
+            'C:/Face-Detection-System/stud_data/ST6.xlsx',
         ]
         for path in step_files:
             mark_absentees_before_attendance(path)
@@ -237,35 +275,46 @@ def reset_daily_state():
 def process_frame(frame, frame_bg):
     global current_mode, mode_start_time, current_student_id
 
-    # Resize frame for faster face detection
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-    rgb_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
     
-    face_locations = face_recognition.face_locations(rgb_frame)
-    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+    # Detect faces using InsightFace
+    faces = face_analyzer.get(small_frame)
     
-    # Process each detected face
-    for encoding, face_location in zip(face_encodings, face_locations):
-        matches = face_recognition.compare_faces(founded_encodings, encoding, FACE_MATCH_THRESHOLD)
-        face_distances = face_recognition.face_distance(founded_encodings, encoding)
-
-        if not matches[np.argmin(face_distances)]:
+    for face in faces:
+        current_embedding = face.embedding
+        
+        if founded_encodings.size == 0:
+            continue  # No encodings loaded
+        
+        # Normalize embeddings for cosine similarity calculation
+        current_embedding_norm = current_embedding / np.linalg.norm(current_embedding)
+        stored_encodings_norm = founded_encodings / np.linalg.norm(founded_encodings, axis=1, keepdims=True)
+        
+        # Calculate similarities
+        similarities = np.dot(stored_encodings_norm, current_embedding_norm)
+        best_match_idx = np.argmax(similarities)
+        best_similarity = similarities[best_match_idx]
+        
+        if best_similarity < FACE_MATCH_THRESHOLD:
             continue
-
-        student_id = stud_ID[np.argmin(face_distances)]
+        
+        student_id = stud_ID[best_match_idx]
         last_seen[student_id] = time.time()
 
-        # Scale the coordinates from the small frame to the original size
-        top, right, bottom, left = [v * 4 for v in face_location]
+        # Scale face coordinates to original frame size
+        bbox = face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
+        x1 *= 4
+        y1 *= 4
+        x2 *= 4
+        y2 *= 4
 
-        # Draw the rectangle directly on frame_bg by adding the background offsets (55, 162)
-        cv2.rectangle(frame_bg, (55 + left, 162 + top), (55 + right, 162 + bottom), (0, 255, 0), 2)
-    
-        # Draw the student ID above the rectangle on frame_bg
-        cv2.putText(frame_bg, f"ID: {student_id}", (55 + left, 162 + top - 10),
+        # Draw rectangle on frame
+        cv2.rectangle(frame_bg, (55 + x1, 162 + y1), (55 + x2, 162 + y2), (0, 255, 0), 2)
+        cv2.putText(frame_bg, f"ID: {student_id}", (55 + x1, 162 + y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Attendance and mode processing logic remains unchanged...
+        # Attendance logic remains unchanged
         if student_id not in detected_students:
             if is_already_present(student_id):
                 if time.time() - cooldown_tracker.get(student_id, 0) > COOLDOWN_SECONDS:
@@ -303,9 +352,9 @@ def process_frame(frame, frame_bg):
 def main():
     global current_mode, mode_start_time, current_student_id
 
-    # Initialization
     load_encodings()
     load_mode_images()
+    init_face_analyzer()  # Initialize InsightFace model
     
     for path in STEP_FILES.values():
         if not os.path.exists(path):
@@ -318,12 +367,14 @@ def main():
                 "3. No typos in file names"
             )
 
-    # Holiday and absence marking
     for path in STEP_FILES.values():
         if mark_off_if_needed(path):
             print("System exiting due to holiday/weekend")
             return
         mark_absentees_before_attendance(path)
+    
+    # Preload students already marked 'P' for today
+    preload_detected_students()
 
     cap = cv2.VideoCapture(0)
     cap.set(3, FRAME_WIDTH)
@@ -336,15 +387,12 @@ def main():
             continue
 
         reset_daily_state()
-        # Create a copy of the background to overlay the webcam feed
         frame_bg = imagebackground.copy()
         frame_bg[162:162+480, 55:55+640] = img
         
-        # Process the frame for face detection and mode updates.
         process_frame(img, frame_bg)
 
-        
-        # Mode transitions handling
+        # Mode timing logic remains unchanged
         if current_mode in [1, 2, 3] and mode_start_time:
             elapsed = time.time() - mode_start_time
             if elapsed > MODE_DISPLAY_DURATION:
@@ -361,9 +409,9 @@ def main():
                     current_mode = 0
                     mode_start_time = None
 
-        # UI rendering: overlay the mode image on the background
         frame_bg[44:44+633, 808:808+414] = imgModeList[current_mode]
         
+        # Student info display logic remains unchanged
         if current_mode == 1 and current_student_id:
             student = student_data.get(current_student_id)
             if student:
@@ -383,6 +431,7 @@ def main():
                            cv2.FONT_HERSHEY_COMPLEX, 0.5, (255,255,255), 1)
 
         cv2.imshow("STEP School Talagang Campus", frame_bg)
+
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord('q')):
             print("User requested exit. Exiting...")

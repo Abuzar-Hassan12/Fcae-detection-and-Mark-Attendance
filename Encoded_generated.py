@@ -1,57 +1,79 @@
 import cv2
-import face_recognition
 import pickle
 import os
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from insightface.app import FaceAnalysis
+import numpy as np
 
-# Define the path to the folder containing student images
-images_Path = 'images'
-stud_images_path = os.listdir(images_Path)
+# Configuration
+IMAGES_FOLDER = 'images'
+MAX_IMAGE_DIMENSION = 800 
+OUTPUT_FILE = 'Encoding File.p'
 
-# Initialize lists to store encodings and corresponding IDs
-encoded_list = []
-stud_ID = []
+# Initialize face analysis once globally for multiprocessing
+app = None
 
-def find_encodings(images_path_list):
-    valid_encodings = []
-    valid_ids = []
-    
-    for path in images_path_list:
-        full_path = os.path.join(images_Path, path)
-        # Load image
-        img = cv2.imread(full_path)
+def init_insightface_model():
+    global app
+    app = FaceAnalysis(name="buffalo_l")  # You can use 'buffalo_l' or 'buffalo_s' (small, faster)
+    app.prepare(ctx_id=0, det_size=(640, 640))  # Set GPU (0) or CPU (-1)
+
+def process_single_image(images_folder, filename):
+    try:
+        filepath = os.path.join(images_folder, filename)
+        img = cv2.imread(filepath)
         if img is None:
-            print(f"Warning: Could not read image {path}. Skipping.")
-            continue
-        
-        # Convert image to RGB format
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Find face locations and encodings
-        face_locations = face_recognition.face_locations(img_rgb, model='hog')  # 'cnn' for better accuracy
-        face_encodings = face_recognition.face_encodings(img_rgb, face_locations)
+            print(f"⚠️ Couldn't read: {filename}")
+            return None
 
-        if len(face_encodings) == 0:
-            print(f"No face detected in {path}. Skipping.")
-            continue
-        
-        # Select the largest face (best candidate for ID matching)
-        largest_face_index = max(range(len(face_locations)), key=lambda i: (face_locations[i][2] - face_locations[i][0]) * (face_locations[i][1] - face_locations[i][3]))
-        valid_encodings.append(face_encodings[largest_face_index])
-        
-        # Add the corresponding student ID (filename without extension)
-        valid_ids.append(os.path.splitext(path)[0])
+        # Resize large images for faster processing
+        h, w = img.shape[:2]
+        scale = MAX_IMAGE_DIMENSION / max(h, w)
+        if scale < 1:
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        faces = app.get(img)
+        if not faces:
+            print(f"🚫 No face in {filename}")
+            return None
+
+        # Select the most prominent (largest) face
+        largest_face = max(faces, key=lambda f: f.bbox[2] - f.bbox[0])
+        embedding = largest_face.embedding  # 512-d feature vector
+
+        return (embedding, os.path.splitext(filename)[0])
+
+    except Exception as e:
+        print(f"🔥 Error processing {filename}: {str(e)}")
+        return None
+
+def batch_process_images(image_folder, filenames):
+    processor_count = min(cpu_count(), 8)
+    with Pool(processes=processor_count, initializer=init_insightface_model) as pool:
+        process_task = partial(process_single_image, image_folder)
+        results = pool.map(process_task, filenames)
+
+    successful_results = [r for r in results if r is not None]
+    if not successful_results:
+        return [], []
     
-    return valid_encodings, valid_ids
+    return zip(*successful_results)
 
-# Process all images and get valid encodings with IDs
-encoded_list, stud_ID = find_encodings(stud_images_path)
+if __name__ == '__main__':
+    image_files = os.listdir(IMAGES_FOLDER)
+    print(f"🖼️ Found {len(image_files)} images to process")
 
-# Save the encodings with corresponding IDs to a temporary file first
-temp_file = 'Encoding File.temp.p'
-with open(temp_file, 'wb') as encoded_file:
-    pickle.dump([encoded_list, stud_ID], encoded_file)
+    encodings, ids = batch_process_images(IMAGES_FOLDER, image_files)
 
-# Rename temp file to avoid corruption issues
-os.replace(temp_file, 'Encoding File.p')
+    # Convert encodings (list of numpy arrays) to list of lists for pickling
+    encodings = [enc.tolist() if isinstance(enc, np.ndarray) else enc for enc in encodings]
 
-print(f"Successfully encoded {len(encoded_list)} images out of {len(stud_images_path)}")
+    temp_file = OUTPUT_FILE + '.tmp'
+    with open(temp_file, 'wb') as f:
+        pickle.dump({'encodings': encodings, 'ids': ids}, f)
+    os.replace(temp_file, OUTPUT_FILE)
+
+    success_rate = len(encodings)/len(image_files) * 100
+    print(f"✅ Success: {len(encodings)}/{len(image_files)} ({success_rate:.1f}%)")
+    print(f"📁 Encodings saved to {OUTPUT_FILE}")

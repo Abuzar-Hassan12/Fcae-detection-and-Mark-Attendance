@@ -1,29 +1,34 @@
 import cv2
-#import matplotlib.pyplot as plt
-import os
-import pickle
+import face_recognition
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import time
 import re
 from threading import Lock
-from insightface.app import FaceAnalysis
+import os
+import pickle
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # ========================
 # CONFIGURATION SETTINGS
 # ========================
 ENCODING_FILE = 'Encoding File.p'
-modeFolderPath = "C:\\Face-Detection-System\\Resources\\Modes"
-imagebackground = cv2.imread('Resources/background.png')  
+IMAGES_FOLDER = 'images'
+MAX_IMAGE_DIMENSION = 800
+FACE_DETECTION_MODEL = 'hog'
+NUM_ENCODING_JITTERS = 1
+modeFolderPath = "Modes"
+imagebackground = cv2.imread('Resources/background.png')
 HOLIDAYS = ['23-03-2025', '01-05-2025', '14-08-2025']
 FRAME_WIDTH, FRAME_HEIGHT = 640, 480
 MODE_DISPLAY_DURATION = 5
-FACE_MATCH_THRESHOLD = 0.6  # Cosine similarity threshold
+FACE_MATCH_THRESHOLD = 0.4
 ATTENDANCE_START_TIME = datetime.strptime("6:00:00 AM", "%I:%M:%S %p").time()
 ATTENDANCE_END_TIME = datetime.strptime("11:00:00 AM", "%I:%M:%S %p").time()
-COOLDOWN_SECONDS = 30  # Increased cooldown period
-EXCEL_LOCK = Lock()  # Thread safety for Excel operations
+COOLDOWN_SECONDS = 30
+EXCEL_LOCK = Lock()
 
 # ========================
 # GLOBAL STATE VARIABLES
@@ -36,7 +41,83 @@ current_mode = 0
 mode_start_time = None
 current_student_id = None
 last_date_check = datetime.now()
-face_analyzer = None
+founded_encodings = []
+stud_ID = []
+
+# ========================
+# ENCODING GENERATION FUNCTIONS
+# ========================
+def process_single_image(images_folder, filename):
+    try:
+        filepath = os.path.join(images_folder, filename)
+        img = cv2.imread(filepath)
+        if img is None:
+            print(f"⚠️ Couldn't read: {filename}")
+            return None
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w = img_rgb.shape[:2]
+        scale = MAX_IMAGE_DIMENSION / max(h, w)
+        if scale < 1:
+            img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+        face_locations = face_recognition.face_locations(img_rgb, model=FACE_DETECTION_MODEL)
+        if not face_locations:
+            print(f"🚫 No face in {filename}")
+            return None
+
+        largest_face = max(face_locations, key=lambda loc: (loc[2]-loc[0])*(loc[1]-loc[3]))
+        encoding = face_recognition.face_encodings(
+            img_rgb, 
+            known_face_locations=[largest_face],
+            num_jitters=NUM_ENCODING_JITTERS
+        )[0]
+        return (encoding, os.path.splitext(filename)[0])
+    except Exception as e:
+        print(f"Error processing {filename}: {str(e)}")
+        return None
+def batch_process_images(images_folder, filenames):
+    processor_count = min(cpu_count(), 8)
+    process_task = partial(process_single_image, images_folder)
+    with Pool(processes=processor_count) as pool:
+        results = pool.map(process_task, filenames)
+    successful_results = [r for r in results if r is not None]
+    if not successful_results:
+        return [], []
+    encodings, ids = zip(*successful_results)
+    return list(encodings), list(ids)  # Convert tuples to lists
+
+def check_and_update_encodings():
+    if not os.path.exists(ENCODING_FILE):
+        print("Encoding file not found. Generating from all images...")
+        image_files = os.listdir(IMAGES_FOLDER)
+        encodings, ids = batch_process_images(IMAGES_FOLDER, image_files)
+        data = {'encodings': encodings, 'ids': ids}
+        with open(ENCODING_FILE, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"Encodings saved to {ENCODING_FILE}")
+    else:
+        with open(ENCODING_FILE, 'rb') as f:
+            data = pickle.load(f)
+        # Ensure encodings and ids are lists (legacy files might have tuples)
+        if isinstance(data['encodings'], tuple):
+            data['encodings'] = list(data['encodings'])
+        if isinstance(data['ids'], tuple):
+            data['ids'] = list(data['ids'])
+        
+        existing_ids = set(data['ids'])
+        current_images = os.listdir(IMAGES_FOLDER)
+        current_ids = {os.path.splitext(img)[0] for img in current_images}
+        new_images = [img for img in current_images if os.path.splitext(img)[0] not in existing_ids]
+        
+        if new_images:
+            print(f"Found {len(new_images)} new images. Updating encoding file...")
+            new_encodings, new_ids = batch_process_images(IMAGES_FOLDER, new_images)
+            data['encodings'].extend(new_encodings)
+            data['ids'].extend(new_ids)
+            with open(ENCODING_FILE, 'wb') as f:
+                pickle.dump(data, f)
+            print(f"Updated encoding file with {len(new_ids)} new entries.")
 
 # ========================
 # INITIALIZATION FUNCTIONS
@@ -46,27 +127,28 @@ def load_encodings():
     with open(ENCODING_FILE, 'rb') as encode_file:
         encodings_dict = pickle.load(encode_file)
         founded_encodings, stud_ID = encodings_dict['encodings'], encodings_dict['ids']
-    
-    # Convert to NumPy float32 array for InsightFace compatibility
-    founded_encodings = np.array(founded_encodings, dtype=np.float32)
+    founded_encodings = np.array(founded_encodings, dtype=np.float64)
 
 def load_mode_images():
     global imgModeList
     if not os.path.exists(modeFolderPath):
         raise FileNotFoundError(f"Directory not found: {modeFolderPath}")
-
-    mode_files = sorted([f for f in os.listdir(modeFolderPath) if re.match(r"^mode[0-3]\.png$", f)], 
-                       key=lambda x: int(x[4:-4]))
-    
+    mode_files = sorted([f for f in os.listdir(modeFolderPath) if re.match(r"^mode[0-3]\.png$", f)], key=lambda x: int(x[4:-4]))
     if len(mode_files) != 4:
         raise ValueError(f"Need exactly 4 mode images. Found {len(mode_files)}")
-
     imgModeList = [cv2.imread(os.path.join(modeFolderPath, f)) for f in mode_files]
+# def load_mode_images():
+#     global imgModeList
+#     if not os.path.exists(modeFolderPath):
+#         raise FileNotFoundError(f"Directory not found: {modeFolderPath}")
 
-def init_face_analyzer():
-    global face_analyzer
-    face_analyzer = FaceAnalysis(name="buffalo_l")
-    face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+#     mode_files = sorted([f for f in os.listdir(modeFolderPath) if re.match(r"^mode[0-3]\.png$", f)], 
+#                        key=lambda x: int(x[4:-4]))
+    
+#     if len(mode_files) != 4:
+#         raise ValueError(f"Need exactly 4 mode images. Found {len(mode_files)}")
+
+#     imgModeList = [cv2.imread(os.path.join(modeFolderPath, f)) for f in mode_files]
 
 # ========================
 # ATTENDANCE CORE FUNCTIONS
@@ -276,45 +358,28 @@ def process_frame(frame, frame_bg):
     global current_mode, mode_start_time, current_student_id
 
     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+    rgb_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
     
-    # Detect faces using InsightFace
-    faces = face_analyzer.get(small_frame)
+    face_locations = face_recognition.face_locations(rgb_frame)
+    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
     
-    for face in faces:
-        current_embedding = face.embedding
-        
-        if founded_encodings.size == 0:
-            continue  # No encodings loaded
-        
-        # Normalize embeddings for cosine similarity calculation
-        current_embedding_norm = current_embedding / np.linalg.norm(current_embedding)
-        stored_encodings_norm = founded_encodings / np.linalg.norm(founded_encodings, axis=1, keepdims=True)
-        
-        # Calculate similarities
-        similarities = np.dot(stored_encodings_norm, current_embedding_norm)
-        best_match_idx = np.argmax(similarities)
-        best_similarity = similarities[best_match_idx]
-        
-        if best_similarity < FACE_MATCH_THRESHOLD:
+    for encoding, face_location in zip(face_encodings, face_locations):
+        matches = face_recognition.compare_faces(founded_encodings, encoding, FACE_MATCH_THRESHOLD)
+        face_distances = face_recognition.face_distance(founded_encodings, encoding)
+
+        if not matches[np.argmin(face_distances)]:
             continue
         
-        student_id = stud_ID[best_match_idx]
+        student_id = stud_ID[np.argmin(face_distances)]
         last_seen[student_id] = time.time()
 
-        # Scale face coordinates to original frame size
-        bbox = face.bbox.astype(int)
-        x1, y1, x2, y2 = bbox
-        x1 *= 4
-        y1 *= 4
-        x2 *= 4
-        y2 *= 4
+        top, right, bottom, left = [v * 4 for v in face_location]
 
-        # Draw rectangle on frame
-        cv2.rectangle(frame_bg, (55 + x1, 162 + y1), (55 + x2, 162 + y2), (0, 255, 0), 2)
-        cv2.putText(frame_bg, f"ID: {student_id}", (55 + x1, 162 + y1 - 10),
+        cv2.rectangle(frame_bg, (55 + left, 162 + top), (55 + right, 162 + bottom), (0, 255, 0), 2)
+    
+        cv2.putText(frame_bg, f"ID: {student_id}", (55 + left, 162 + top - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Attendance logic remains unchanged
         if student_id not in detected_students:
             if is_already_present(student_id):
                 if time.time() - cooldown_tracker.get(student_id, 0) > COOLDOWN_SECONDS:
@@ -351,48 +416,34 @@ def process_frame(frame, frame_bg):
 # ========================
 def main():
     global current_mode, mode_start_time, current_student_id
-
+    check_and_update_encodings()
     load_encodings()
     load_mode_images()
-    init_face_analyzer()  # Initialize InsightFace model
     
     for path in STEP_FILES.values():
         if not os.path.exists(path):
-            raise SystemExit(
-                f"Critical error: Required file not found\n"
-                f"Missing: {path}\n"
-                "Please check:\n"
-                "1. File exists at specified location\n"
-                "2. Path matches your system configuration\n"
-                "3. No typos in file names"
-            )
-
+            raise SystemExit(f"Critical error: Required file not found\nMissing: {path}")
     for path in STEP_FILES.values():
         if mark_off_if_needed(path):
             print("System exiting due to holiday/weekend")
             return
         mark_absentees_before_attendance(path)
-    
-    # Preload students already marked 'P' for today
     preload_detected_students()
-
+    
     cap = cv2.VideoCapture(0)
     cap.set(3, FRAME_WIDTH)
     cap.set(4, FRAME_HEIGHT)
     time.sleep(2)
-
+    
     while True:
         success, img = cap.read()
         if not success:
             continue
-
         reset_daily_state()
         frame_bg = imagebackground.copy()
         frame_bg[162:162+480, 55:55+640] = img
-        
         process_frame(img, frame_bg)
-
-        # Mode timing logic remains unchanged
+        
         if current_mode in [1, 2, 3] and mode_start_time:
             elapsed = time.time() - mode_start_time
             if elapsed > MODE_DISPLAY_DURATION:
@@ -408,36 +459,25 @@ def main():
                 elif current_mode == 3:
                     current_mode = 0
                     mode_start_time = None
-
         frame_bg[44:44+633, 808:808+414] = imgModeList[current_mode]
         
-        # Student info display logic remains unchanged
         if current_mode == 1 and current_student_id:
             student = student_data.get(current_student_id)
             if student:
                 if student['image'] is not None:
                     frame_bg[175:175+216, 909:909+216] = student['image']
-                
                 (w, h), _ = cv2.getTextSize(student['name'], cv2.FONT_HERSHEY_COMPLEX, 1, 1)
                 x_pos = 808 + (414 - w) // 2
-                
-                cv2.putText(frame_bg, str(student['attendance']), (861, 125),
-                           cv2.FONT_HERSHEY_COMPLEX, 1, (255,255,255), 1)
-                cv2.putText(frame_bg, student['name'], (x_pos, 445),
-                           cv2.FONT_HERSHEY_COMPLEX, 1, (50,50,50), 1)
-                cv2.putText(frame_bg, f"ID: {current_student_id}", (1006, 493),
-                           cv2.FONT_HERSHEY_COMPLEX, 0.5, (255,255,255), 1)
-                cv2.putText(frame_bg, get_major(current_student_id), (1006, 550),
-                           cv2.FONT_HERSHEY_COMPLEX, 0.5, (255,255,255), 1)
-
+                cv2.putText(frame_bg, str(student['attendance']), (861, 125), cv2.FONT_HERSHEY_COMPLEX, 1, (255,255,255), 1)
+                cv2.putText(frame_bg, student['name'], (x_pos, 445), cv2.FONT_HERSHEY_COMPLEX, 1, (50,50,50), 1)
+                cv2.putText(frame_bg, f"ID: {current_student_id}", (1006, 493), cv2.FONT_HERSHEY_COMPLEX, 0.5, (255,255,255), 1)
+                cv2.putText(frame_bg, get_major(current_student_id), (1006, 550), cv2.FONT_HERSHEY_COMPLEX, 0.5, (255,255,255), 1)
+        
         cv2.imshow("STEP School Talagang Campus", frame_bg)
-
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord('q')):
-            print("User requested exit. Exiting...")
             break
         if cv2.getWindowProperty("STEP School Talagang Campus", cv2.WND_PROP_VISIBLE) < 1:
-            print("Window closed by user. Exiting...")
             break
     cap.release()
     cv2.destroyAllWindows()
